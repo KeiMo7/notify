@@ -66,6 +66,7 @@ func readConfig() {
 	set.StringVar(&options.Proxy, "proxy", "", "HTTP/SOCKSv5 proxy to use with notify")
 	set.CallbackVarP(runner.GetUpdateCallback(), "update", "up", "update notify to latest version")
 	set.BoolVarP(&options.DisableUpdateCheck, "disable-update-check", "duc", false, "disable automatic notify update check")
+	set.BoolVar(&options.ReliabilityEnabled, "reliability", false, "enable failure handling: bounded retries, channel circuit breakers, duplicate suppression and local spill queue (parameters in provider config reliability section)")
 
 	_ = set.Parse()
 

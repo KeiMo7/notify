@@ -21,4 +21,10 @@ type Options struct {
 	CharLimit          int    `yaml:"char_limit,omitempty"`
 	Data               string `yaml:"data,omitempty"`
 	DisableUpdateCheck bool   `yaml:"disable_update_check,omitempty"`
+
+	// ReliabilityEnabled is the CLI/config switch for the opt-in failure
+	// handling feature (backoff retries, circuit breakers, dedup, spill
+	// queue). The detailed parameters live in the provider config's
+	// "reliability" section; this flag only turns the feature on.
+	ReliabilityEnabled bool `yaml:"reliability,omitempty"`
 }

@@ -16,6 +16,7 @@ import (
 
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/notify/pkg/providers"
+	"github.com/projectdiscovery/notify/pkg/reliability"
 	"github.com/projectdiscovery/notify/pkg/types"
 	"github.com/projectdiscovery/notify/pkg/utils"
 	fileutil "github.com/projectdiscovery/utils/file"
@@ -49,6 +50,14 @@ func NewRunner(options *types.Options) (*Runner, error) {
 		return nil, errors.Wrap(parseErr, "could not parse provider config file")
 	}
 
+	// The CLI flag can switch the feature on even when the provider config
+	// omits the section entirely; parameters then fall back to defaults.
+	// The YAML section stays the only place to tune individual parameters,
+	// and an explicitly disabled section is never overridden back on.
+	if options.ReliabilityEnabled && !providerOptions.Reliability.Enabled {
+		providerOptions.Reliability.Enabled = true
+	}
+
 	shoutrrr.SetLogger(log.New(io.Discard, "", 0))
 
 	prClient, err := providers.New(&providerOptions, options)
@@ -76,6 +85,25 @@ func (r *Runner) Run() error {
 	http.DefaultClient.Transport = defaultTransport
 	if r.options.RateLimit > 0 {
 		http.DefaultClient.Transport = utils.NewThrottledTransport(time.Second, r.options.RateLimit, defaultTransport)
+	}
+
+	// When reliability is enabled, wrap the transport actually in use so the
+	// classifier observes explicit channel signals (HTTP 429 / Retry-After).
+	// The wrapper is pass-through: request and body bytes are never copied or
+	// buffered, so a non-reliability run is byte-for-byte the old path.
+	var engine *reliability.Engine
+	if r.providers != nil {
+		engine = r.providers.ReliabilityEngine()
+	}
+	if engine != nil {
+		http.DefaultClient.Transport = reliability.NewInstrumentedTransport(
+			http.DefaultClient.Transport, engine.Collector())
+
+		// Replay anything left in the spill queue by a previous run that
+		// ended while all channels were unavailable.
+		if replayed, remaining := engine.ReplayQueue(); replayed > 0 {
+			gologger.Info().Msgf("reliability: replayed %d queued message(s), %d still pending", replayed, remaining)
+		}
 	}
 
 	var inFile *os.File
@@ -114,6 +142,11 @@ func (r *Runner) Run() error {
 
 	br.Split(splitter)
 
+	// Flush any coalesced duplicate window at normal end of input. Close is
+	// idempotent-ish: an empty deduper emits nothing, and the signal handler
+	// may also call it on termination without harm.
+	defer r.Close()
+
 	for br.Scan() {
 		msg := br.Text()
 		//nolint:errcheck
@@ -137,4 +170,10 @@ func (r *Runner) sendMessage(msg string) error {
 }
 
 // Close the runner instance
-func (r *Runner) Close() {}
+func (r *Runner) Close() {
+	if r.providers != nil {
+		if engine := r.providers.ReliabilityEngine(); engine != nil {
+			engine.Close()
+		}
+	}
+}

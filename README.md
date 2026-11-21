@@ -71,6 +71,93 @@ This will display help for the tool. Here are all the switches it supports.
 | `-version`              | display version                                    | `notify -version`                     |
 | `-update`               | updates to latest version                          | `notify -update`                      |
 | `-disable-update-check` | disables automatic update check                    | `notify -duc`                         |
+| `-reliability`          | enable failure handling (retries, circuit breakers, dedup, spill queue) | `notify -reliability` |
+
+# Failure handling (reliability mode)
+
+Notify can optionally protect the push pipeline against channel failures
+without changing any existing channel adapter or message format. The whole
+feature is **opt-in**: it stays dormant unless enabled, and when disabled the
+send path is byte-for-byte the legacy one.
+
+Enable it either with the `-reliability` flag or by adding a
+`reliability` section to the provider config. The flag switches the feature
+on with all parameters defaulted; the YAML section is the only place to tune
+individual parameters.
+
+```yaml
+reliability:
+  enabled: true
+  max_retries: 3                 # retries per send (the original attempt is not counted)
+  backoff_initial: 500ms         # first retry delay, then exponential: initial*2^n
+  backoff_max: 10s               # cap on a single retry delay
+  max_retry_time: 15s            # wall-clock cap for retries of one send
+  failure_threshold: 5           # consecutive failures before a channel is paused
+  cooldown: 60s                  # how long a paused channel stays skipped before a probe
+  dedup_window: 0s               # >0 merges identical messages inside one window
+  queue_max_entries: 1000        # spill-queue bound; overflow drops the OLDEST and counts
+  queue_path: ""                 # default: next to the provider config
+```
+
+## Failure classes and what happens to each
+
+Classification uses the channel's **explicit signals only** — never response
+time. HTTP status codes and the `Retry-After` header are read through an
+instrumented transport; non-HTTP channels (e.g. SMTP) fall back to the
+protocol error text, and a rate-limit verdict still requires an explicit
+token (`429`, `Retry-After`, "rate limit"/"too many requests").
+
+| Class | Signals | Disposition |
+|---|---|---|
+| Rate limited | HTTP 429, or 503 with `Retry-After` | bounded exponential backoff retry; `Retry-After` is honored when larger |
+| Authentication failed | 401 / 403 / 407, SMTP 535, invalid token | **no retry**, immediate error-level alert |
+| Content rejected | 400 / 413 / 422 / 415 | no retry (the identical payload would fail again) |
+| Unreachable | connection reset/refused, DNS failure, timeout, 5xx, 404/410 | retried with backoff |
+| Unknown | anything unattributable | retried conservatively |
+
+Retries are bounded two ways — `max_retries` (attempt count) and
+`max_retry_time` (wall clock) — so a single send performs at most
+`1 + max_retries` requests and total push time never exceeds the legacy
+upper bound plus one bounded retry budget.
+
+## Channel degradation (circuit breaker)
+
+When a channel fails `failure_threshold` times in a row it is **paused**:
+subsequent sends skip it with zero network requests, an alert is emitted, and
+every other channel continues normally. After `cooldown` exactly one probe
+is allowed through; success restores the channel, failure re-pauses it.
+Degraded channels and failure counts are observable in the status logs
+emitted on every state transition.
+
+## Duplicate suppression
+
+With `dedup_window` greater than zero, identical messages arriving inside one
+window are merged: the first is delivered immediately, repeats are counted,
+and a single summary (`N duplicate notifications merged …`) is pushed when
+the window closes. Windows close lazily on the next message — there is no
+background timer goroutine.
+
+## Local spill queue and replay
+
+If **every** configured channel fails (or is paused), the message is written
+to a local on-disk queue instead of being dropped. On the next startup the
+queue is replayed automatically in FIFO order; entries are acknowledged only
+after delivery, so a crash cannot lose or duplicate them. The queue is
+bounded by `queue_max_entries`: overflow evicts the oldest entries and keeps
+a persistent `dropped` counter visible in the status logs. A corrupt queue
+file is quarantined (`<path>.corrupt`) rather than taking the process down.
+
+## Known limitations
+
+- Rate-limit detection for channels whose client uses a private HTTP
+  transport (Gotify with TLS verification disabled) relies on the adapter's
+  error text instead of status headers; all other channels use the transport
+  signals.
+- The spill queue is a single local file, best suited to one notify process;
+  do not run multiple processes against the same `queue_path`.
+- Backoff sleeps are part of the bounded per-send budget; with very small
+  `max_retry_time` values fewer retries will fit and the budget, not the
+  attempt count, becomes the effective limit.
 
 # Notify Installation
 
@@ -260,6 +347,8 @@ Notify flags can be configured at default config (`$HOME/.config/notify/config.y
 ## Notes
 - As default notify sends notification line by line
 - Use `-bulk` to send notification as entire message/s (messages might be chunked)
+- Reliability mode is opt-in (`-reliability` or a `reliability:` config section); with it off, behavior and request volume are identical to older versions
+- The spill queue file lives next to the provider config (`provider-config.yaml.pending.json` by default) and is safe to inspect while notify is not running; do not hand-edit it
 
 ## References
 

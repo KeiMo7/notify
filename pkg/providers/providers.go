@@ -1,6 +1,9 @@
 package providers
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/acarl005/stripansi"
 	"github.com/pkg/errors"
 	"go.uber.org/multierr"
@@ -16,6 +19,7 @@ import (
 	"github.com/projectdiscovery/notify/pkg/providers/smtp"
 	"github.com/projectdiscovery/notify/pkg/providers/teams"
 	"github.com/projectdiscovery/notify/pkg/providers/telegram"
+	"github.com/projectdiscovery/notify/pkg/reliability"
 	"github.com/projectdiscovery/notify/pkg/types"
 	sliceutil "github.com/projectdiscovery/utils/slice"
 )
@@ -32,6 +36,11 @@ type ProviderOptions struct {
 	Custom     []*custom.Options     `yaml:"custom,omitempty"`
 	Gotify     []*gotify.Options     `yaml:"gotify,omitempty"`
 	RocketChat []*rocketchat.Options `yaml:"rocketchat,omitempty"`
+
+	// Reliability is the opt-in failure-handling section (retries,
+	// circuit breakers, dedup, spill queue). Absent or disabled means the
+	// legacy send behavior is preserved exactly.
+	Reliability reliability.Config `yaml:"reliability,omitempty"`
 }
 
 // Provider is an interface implemented by providers
@@ -43,6 +52,9 @@ type Client struct {
 	providers       []Provider
 	providerOptions *ProviderOptions
 	options         *types.Options
+
+	// engine is non-nil only when the reliability feature is enabled.
+	engine *reliability.Engine
 }
 
 func New(providerOptions *ProviderOptions, options *types.Options) (*Client, error) {
@@ -134,13 +146,39 @@ func New(providerOptions *ProviderOptions, options *types.Options) (*Client, err
 		client.providers = append(client.providers, provider)
 	}
 
+	// Startup validation: an illegal reliability section is rejected here,
+	// naming the offending field, before any input is read.
+	if err := providerOptions.Reliability.Validate(); err != nil {
+		return nil, errors.Wrap(err, "invalid reliability configuration")
+	}
+
+	if err := client.initReliability(&providerOptions.Reliability); err != nil {
+		return nil, err
+	}
+
 	return client, nil
+}
+
+// providerName derives a stable short name ("discord", "telegram", ...) from
+// the concrete adapter type without requiring any change to the adapters.
+func providerName(p Provider) string {
+	typ := fmt.Sprintf("%T", p)
+	typ = strings.TrimPrefix(typ, "*")
+	if idx := strings.Index(typ, "."); idx >= 0 {
+		typ = typ[idx+1:]
+	}
+	return strings.TrimSuffix(strings.ToLower(typ), ".provider")
 }
 
 func (p *Client) Send(message string) error {
 
 	// strip unsupported color control chars
 	message = stripansi.Strip(message)
+
+	// Opt-in path: retries, breakers, dedup and spill queue own dispatch.
+	if p.engine != nil {
+		return p.engine.Send(message)
+	}
 
 	for _, v := range p.providers {
 		if err := v.Send(message, p.options.MessageFormat); err != nil {
@@ -152,3 +190,7 @@ func (p *Client) Send(message string) error {
 
 	return nil
 }
+
+// ReliabilityEngine exposes the engine (nil when disabled) so the runner can
+// install the instrumented transport and trigger queue replay.
+func (p *Client) ReliabilityEngine() *reliability.Engine { return p.engine }
