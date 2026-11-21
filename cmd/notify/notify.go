@@ -66,6 +66,11 @@ func readConfig() {
 	set.StringVar(&options.Proxy, "proxy", "", "HTTP/SOCKSv5 proxy to use with notify")
 	set.CallbackVarP(runner.GetUpdateCallback(), "update", "up", "update notify to latest version")
 	set.BoolVarP(&options.DisableUpdateCheck, "disable-update-check", "duc", false, "disable automatic notify update check")
+	set.BoolVar(&options.Dedup, "dedup", false, "only push new or changed messages (deduplicated across runs)")
+	set.StringVar(&options.DedupStore, "dedup-store", "", "dedup state file path (default: $HOME/.config/notify/dedup-state.json)")
+	set.IntVar(&options.DedupRetention, "dedup-retention", 168, "hours a dedup record suppresses re-pushes before the entry may be pushed again")
+	set.StringVar(&options.DedupKeyRegex, "dedup-key-regex", "", "regex whose first capture group extracts the stable identity key from a message (default: whole message)")
+	set.BoolVar(&options.DedupReportRemoved, "dedup-report-removed", false, "also push entries that disappeared since the previous run")
 
 	_ = set.Parse()
 

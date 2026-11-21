@@ -58,6 +58,11 @@ This will display help for the tool. Here are all the switches it supports.
 | `-char-limit`           | max character limit per message (default 4000)     | `notify -cl 2000`                     |
 | `-config`               | notify configuration file                          | `notify -config config.yaml`          |
 | `-data`                 | input file to send for notify                      | `notify -i test.txt`                  |
+| `-dedup`                | only push new or changed messages across runs      | `notify -dedup`                       |
+| `-dedup-store`          | dedup state file path                              | `notify -dedup -dedup-store s.json`   |
+| `-dedup-retention`      | hours a dedup record suppresses re-pushes          | `notify -dedup -dedup-retention 72`   |
+| `-dedup-key-regex`      | regex (1st group) extracting the identity key      | `notify -dedup -dedup-key-regex '^(\S+)'` |
+| `-dedup-report-removed` | also push entries missing since the previous run   | `notify -dedup -dedup-report-removed` |
 | `-delay`                | delay in seconds between each notification         | `notify -d 2`                         |
 | `-id`                   | id to send the notification to (optional)          | `notify -id recon,scans`              |
 | `-msg-format`           | add custom formatting to message                   | `notify -mf Hey {{data}}`             |
@@ -231,6 +236,27 @@ subfinder -d hackerone.com -o h1.txt; notify -data h1.txt -bulk -provider discor
 ```sh
 subfinder -d hackerone.com -o h1.txt; notify -data h1.txt -bulk -id recon,vulns,scan
 ```
+
+### Deduplicating repeated scans
+
+When the same scan output is pushed on a schedule (e.g. hourly cron), `-dedup` pushes only what changed since the last run instead of the full result set every time:
+
+```sh
+nuclei -l targets.txt -o scan.txt; notify -data scan.txt -dedup -dedup-key-regex '^(\S+)'
+```
+
+- Identity is derived from the raw message content only — never from push time, channel name or message formatting. By default the whole line is the identity; `-dedup-key-regex` (first capture group) narrows the identity to e.g. the host, so a line whose conclusion changed is pushed again with a `[notify:changed] old -> new` marker.
+- Dedup state lives in a single JSON file (default `$HOME/.config/notify/dedup-state.json`, override with `-dedup-store`) written atomically (temp file + rename), so a kill mid-write never leaves a half-written record.
+- Successes are recorded **per channel**: if one provider fails, only that provider is retried on the next run — channels that succeeded are not re-notified, and one result is pushed exactly once per channel.
+- Records expire after `-dedup-retention` hours (default 168 = 7 days); expired or long-unseen entries may be pushed again, so a permanently silent item cannot stay silent forever.
+- Entries that disappear from the input are not reported by default; opt in with `-dedup-report-removed` to get a `[notify:removed]` push per vanished entry.
+- Failure handling: a corrupt state file is quarantined next to the original (`<file>.corrupt-<timestamp>`), a warning is printed and the run falls back to a full push; an unwritable state directory degrades to pushing without dedup (with a warning) instead of failing.
+
+Known limitations:
+
+- Channel granularity for dedup is the provider type (`slack`, `discord`, `custom`, ...). Multiple configs of the same provider type share one dedup channel, so if one config of a type fails, all configs of that type are retried.
+- The state file grows with the number of distinct results (entries not seen within the retention window are pruned on save).
+- `-dedup` adds one in-memory lookup per message and one state-file write per run; with dedup off, behavior and performance are identical to before.
 
 ### Example Uses
 

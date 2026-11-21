@@ -1,6 +1,9 @@
 package providers
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/acarl005/stripansi"
 	"github.com/pkg/errors"
 	"go.uber.org/multierr"
@@ -137,18 +140,70 @@ func New(providerOptions *ProviderOptions, options *types.Options) (*Client, err
 	return client, nil
 }
 
-func (p *Client) Send(message string) error {
+// SendResult is the per-channel outcome of one SendWithResults call.
+type SendResult struct {
+	// Provider is the stable channel name (e.g. "slack", "discord").
+	Provider string
+	Err      error
+}
 
+// Names returns the stable channel names of the configured providers, in
+// send order. The names are derived from the provider type and contain no
+// credentials, timestamps or formatting details, so they are safe to use
+// as dedup channel identifiers.
+func (p *Client) Names() []string {
+	names := make([]string, 0, len(p.providers))
+	for _, v := range p.providers {
+		names = append(names, providerName(v))
+	}
+	return names
+}
+
+// providerName returns the package name of a provider implementation,
+// e.g. "*slack.Provider" -> "slack".
+func providerName(v Provider) string {
+	t := fmt.Sprintf("%T", v) // e.g. *slack.Provider
+	t = strings.TrimPrefix(t, "*")
+	if i := strings.IndexByte(t, '.'); i >= 0 {
+		t = t[:i]
+	}
+	return t
+}
+
+// SendWithResults sends the message to each configured provider and
+// reports the outcome per channel. When only is non-empty, providers whose
+// name is not in the list are skipped. A failure in one channel never
+// affects the others.
+func (p *Client) SendWithResults(message string, only []string) []SendResult {
 	// strip unsupported color control chars
 	message = stripansi.Strip(message)
 
+	var filter map[string]bool
+	if len(only) > 0 {
+		filter = make(map[string]bool, len(only))
+		for _, name := range only {
+			filter[name] = true
+		}
+	}
+
+	results := make([]SendResult, 0, len(p.providers))
 	for _, v := range p.providers {
-		if err := v.Send(message, p.options.MessageFormat); err != nil {
-			for _, v := range multierr.Errors(err) {
+		name := providerName(v)
+		if filter != nil && !filter[name] {
+			continue
+		}
+		results = append(results, SendResult{Provider: name, Err: v.Send(message, p.options.MessageFormat)})
+	}
+	return results
+}
+
+func (p *Client) Send(message string) error {
+	for _, result := range p.SendWithResults(message, nil) {
+		if result.Err != nil {
+			for _, v := range multierr.Errors(result.Err) {
 				gologger.Error().Msgf("%s", v)
 			}
 		}
 	}
-
 	return nil
 }
