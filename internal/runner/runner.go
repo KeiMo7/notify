@@ -15,6 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/projectdiscovery/gologger"
+	"github.com/projectdiscovery/notify/pkg/message"
 	"github.com/projectdiscovery/notify/pkg/providers"
 	"github.com/projectdiscovery/notify/pkg/types"
 	"github.com/projectdiscovery/notify/pkg/utils"
@@ -124,12 +125,23 @@ func (r *Runner) Run() error {
 
 func (r *Runner) sendMessage(msg string) error {
 	if len(msg) > 0 {
+		// Refuse malformed input rather than emitting replacement runes.
+		if err := message.Validate(msg); err != nil {
+			gologger.Error().Msgf("dropping message with invalid encoding: %s", err)
+			return err
+		}
+		// Blank messages (empty or whitespace-only) are not notifications.
+		if message.IsBlank(msg) {
+			return nil
+		}
 		if r.options.Delay > 0 {
 			time.Sleep(time.Duration(r.options.Delay) * time.Second)
 		}
-		gologger.Silent().Msgf("%s\n", msg)
-		err := r.providers.Send(msg)
-		if err != nil {
+		// Apply the shared secrecy policy before anything is printed or
+		// handed to a channel: cleartext secrets must never reach logs.
+		redacted := message.Redact(msg)
+		gologger.Silent().Msgf("%s\n", redacted)
+		if err := r.providers.Send(redacted); err != nil {
 			return err
 		}
 	}

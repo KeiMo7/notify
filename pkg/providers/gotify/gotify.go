@@ -17,6 +17,7 @@ import (
 	"go.uber.org/multierr"
 
 	"github.com/projectdiscovery/gologger"
+	msgpkg "github.com/projectdiscovery/notify/pkg/message"
 	"github.com/projectdiscovery/notify/pkg/utils"
 	sliceutil "github.com/projectdiscovery/utils/slice"
 )
@@ -34,6 +35,8 @@ type Options struct {
 	GotifyFormat     string `yaml:"gotify_format,omitempty"`
 	GotifyDisableTLS bool   `yaml:"gotify_disabletls,omitempty"`
 	GotifyTitle      string `yaml:"gotify_title,omitempty"`
+	// MessageLimit overrides the per-channel character budget (runes).
+	MessageLimit int `yaml:"message_limit,omitempty"`
 }
 
 func New(options []*Options, ids []string) (*Provider, error) {
@@ -47,7 +50,105 @@ func New(options []*Options, ids []string) (*Provider, error) {
 
 	provider.counter = 0
 
+	if err := provider.Validate(); err != nil {
+		return nil, err
+	}
 	return provider, nil
+}
+
+func (p *Provider) Name() string { return "gotify" }
+
+func (p *Provider) Validate() error {
+	for _, pr := range p.Gotify {
+		if pr.MessageLimit != 0 {
+			if err := msgpkg.ValidateBudget(pr.MessageLimit); err != nil {
+				return errors.Wrapf(err, "gotify id %q", pr.ID)
+			}
+		}
+	}
+	return nil
+}
+
+func (p *Provider) budget() int {
+	budget := msgpkg.DefaultGotifyBudget
+	for _, pr := range p.Gotify {
+		if pr.MessageLimit > 0 && pr.MessageLimit > budget {
+			budget = pr.MessageLimit
+		}
+	}
+	return budget
+}
+
+func (p *Provider) endpointBudget(pr *Options) int {
+	if pr.MessageLimit > 0 {
+		return pr.MessageLimit
+	}
+	return msgpkg.DefaultGotifyBudget
+}
+
+func (p *Provider) Prepare(redacted string) ([]msgpkg.Chunk, error) {
+	return msgpkg.Process(redacted, msgpkg.Profile{Budget: p.budget(), Syntax: msgpkg.SyntaxNone})
+}
+
+func (p *Provider) SendChunks(chunks []msgpkg.Chunk, cliFormat string) error {
+	var gotifyErr error
+	p.counter++
+
+	for _, pr := range p.Gotify {
+		params := url.Values{}
+		if pr.GotifyTitle != "" {
+			params.Add("title", pr.GotifyTitle)
+		}
+		if pr.GotifyDisableTLS {
+			params.Add("disabletls", "true")
+		}
+		perEndpoint, err := msgpkg.Refit(chunks, p.endpointBudget(pr))
+		if err != nil {
+			gotifyErr = multierr.Append(gotifyErr, errors.Wrapf(err, "id: %s", pr.ID))
+			continue
+		}
+		for _, chunk := range perEndpoint {
+			body := utils.FormatMessage(chunk.Text, utils.SelectFormat(cliFormat, pr.GotifyFormat), p.counter)
+			msg := msgpkg.RenderChunk(msgpkg.Chunk{Index: chunk.Index, Total: chunk.Total, Text: body})
+
+			var err error
+			if isLegacyGotifyToken(pr.GotifyToken) {
+				dest := fmt.Sprintf("gotify://%s:%s/%s", pr.GotifyHost, pr.GotifyPort, pr.GotifyToken)
+				if len(params) > 0 {
+					dest += "?" + params.Encode()
+				}
+				err = shoutrrr.Send(dest, msg)
+				if err != nil && strings.Contains(err.Error(), "invalid gotify token") {
+					err = sendGotifyDirect(pr, msg)
+				}
+			} else {
+				// Gotify 3 tokens (e.g. gtfya.*) are rejected by shoutrrr v0.8.0 which expects legacy 15-char tokens starting with 'A'.
+				// Direct REST API POST sends directly to the Gotify server.
+				err = sendGotifyDirect(pr, msg)
+			}
+
+			if err != nil {
+				gotifyErr = multierr.Append(gotifyErr, errors.Wrapf(err,
+					"failed to send gotify notification for id: %s chunk %d/%d", pr.ID, chunk.Index, chunk.Total))
+				break
+			}
+		}
+		gologger.Verbose().Msgf("gotify notification sent for id: %s", pr.ID)
+	}
+
+	return gotifyErr
+}
+
+// Send is the legacy single-message entry point.
+func (p *Provider) Send(message, cliFormat string) error {
+	chunks, err := p.Prepare(msgpkg.Redact(message))
+	if err != nil {
+		return err
+	}
+	if len(chunks) == 0 {
+		return nil
+	}
+	return p.SendChunks(chunks, cliFormat)
 }
 
 type gotifyPayload struct {
@@ -137,45 +238,4 @@ func sendGotifyDirect(pr *Options, msg string) error {
 	// Drain the success body so the connection can be reused.
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
-}
-
-func (p *Provider) Send(message, CliFormat string) error {
-	var GotifyErr error
-	p.counter++
-
-	for _, pr := range p.Gotify {
-		params := url.Values{}
-		if pr.GotifyTitle != "" {
-			params.Add("title", pr.GotifyTitle)
-		}
-		if pr.GotifyDisableTLS {
-			params.Add("disabletls", "true")
-		}
-		msg := utils.FormatMessage(message, utils.SelectFormat(CliFormat, pr.GotifyFormat), p.counter)
-
-		var err error
-		if isLegacyGotifyToken(pr.GotifyToken) {
-			url := fmt.Sprintf("gotify://%s:%s/%s", pr.GotifyHost, pr.GotifyPort, pr.GotifyToken)
-			if len(params) > 0 {
-				url += "?" + params.Encode()
-			}
-			err = shoutrrr.Send(url, msg)
-			if err != nil && strings.Contains(err.Error(), "invalid gotify token") {
-				err = sendGotifyDirect(pr, msg)
-			}
-		} else {
-			// Gotify 3 tokens (e.g. gtfya.*) are rejected by shoutrrr v0.8.0 which expects legacy 15-char tokens starting with 'A'.
-			// Direct REST API POST sends directly to the Gotify server.
-			err = sendGotifyDirect(pr, msg)
-		}
-
-		if err != nil {
-			err = errors.Wrap(err, fmt.Sprintf("failed to send gotify notification for id: %s ", pr.ID))
-			GotifyErr = multierr.Append(GotifyErr, err)
-			continue
-		}
-		gologger.Verbose().Msgf("gotify notification sent for id: %s", pr.ID)
-	}
-
-	return GotifyErr
 }

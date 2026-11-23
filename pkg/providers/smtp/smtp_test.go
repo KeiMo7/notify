@@ -16,7 +16,7 @@ func TestBuildUrl(t *testing.T) {
 		Subject:     "Email subject",
 	}
 	t.Run("with provider config example", func(t *testing.T) {
-		u := buildUrl(options)
+		u := buildUrl(options, 1, 1)
 		_, err := url.Parse(u)
 		if err != nil {
 			t.Errorf("Failed to parse url: %s", err)
@@ -24,7 +24,7 @@ func TestBuildUrl(t *testing.T) {
 	})
 	t.Run("with octohorpe in password", func(t *testing.T) {
 		options.Password = "passwordwith#inside"
-		u := buildUrl(options)
+		u := buildUrl(options, 1, 1)
 		_, err := url.Parse(u)
 		if err != nil {
 			t.Errorf("Failed to parse url: %s", err)

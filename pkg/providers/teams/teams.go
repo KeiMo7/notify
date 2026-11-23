@@ -16,6 +16,7 @@ import (
 	"go.uber.org/multierr"
 
 	"github.com/projectdiscovery/gologger"
+	msgpkg "github.com/projectdiscovery/notify/pkg/message"
 	"github.com/projectdiscovery/notify/pkg/utils"
 	sliceutil "github.com/projectdiscovery/utils/slice"
 )
@@ -29,6 +30,8 @@ type Options struct {
 	ID              string `yaml:"id,omitempty"`
 	TeamsWebHookURL string `yaml:"teams_webhook_url,omitempty"`
 	TeamsFormat     string `yaml:"teams_format,omitempty"`
+	// MessageLimit overrides the per-channel character budget (runes).
+	MessageLimit int `yaml:"message_limit,omitempty"`
 }
 
 func New(options []*Options, ids []string) (*Provider, error) {
@@ -42,26 +45,83 @@ func New(options []*Options, ids []string) (*Provider, error) {
 
 	provider.counter = 0
 
+	if err := provider.Validate(); err != nil {
+		return nil, err
+	}
 	return provider, nil
 }
 
-// teamsHTTPClient posts Power Automate workflow messages. Office 365 connector
-// webhooks still go through shoutrrr.
-var teamsHTTPClient = &http.Client{Timeout: 15 * time.Second}
+func (p *Provider) Name() string { return "teams" }
 
-func (p *Provider) Send(message, CliFormat string) error {
+func (p *Provider) Validate() error {
+	for _, pr := range p.Teams {
+		if pr.MessageLimit != 0 {
+			if err := msgpkg.ValidateBudget(pr.MessageLimit); err != nil {
+				return errors.Wrapf(err, "teams id %q", pr.ID)
+			}
+		}
+	}
+	return nil
+}
+
+func (p *Provider) budget() int {
+	budget := msgpkg.DefaultTeamsBudget
+	for _, pr := range p.Teams {
+		if pr.MessageLimit > 0 && pr.MessageLimit > budget {
+			budget = pr.MessageLimit
+		}
+	}
+	return budget
+}
+
+func (p *Provider) endpointBudget(pr *Options) int {
+	if pr.MessageLimit > 0 {
+		return pr.MessageLimit
+	}
+	return msgpkg.DefaultTeamsBudget
+}
+
+func (p *Provider) Prepare(redacted string) ([]msgpkg.Chunk, error) {
+	return msgpkg.Process(redacted, msgpkg.Profile{Budget: p.budget(), Syntax: msgpkg.SyntaxNone})
+}
+
+func (p *Provider) SendChunks(chunks []msgpkg.Chunk, cliFormat string) error {
 	var teamsErr error
 	p.counter++
 	for _, pr := range p.Teams {
-		msg := utils.FormatMessage(message, utils.SelectFormat(CliFormat, pr.TeamsFormat), p.counter)
-		if err := sendTeams(pr, msg); err != nil {
-			teamsErr = multierr.Append(teamsErr, err)
+		perEndpoint, err := msgpkg.Refit(chunks, p.endpointBudget(pr))
+		if err != nil {
+			teamsErr = multierr.Append(teamsErr, errors.Wrapf(err, "id: %s", pr.ID))
 			continue
+		}
+		for _, chunk := range perEndpoint {
+			body := utils.FormatMessage(chunk.Text, utils.SelectFormat(cliFormat, pr.TeamsFormat), p.counter)
+			msg := msgpkg.RenderChunk(msgpkg.Chunk{Index: chunk.Index, Total: chunk.Total, Text: body})
+			if err := sendTeams(pr, msg); err != nil {
+				teamsErr = multierr.Append(teamsErr, errors.Wrapf(err, "chunk %d/%d", chunk.Index, chunk.Total))
+				break
+			}
 		}
 		gologger.Verbose().Msgf("teams notification sent for id: %s", pr.ID)
 	}
 	return teamsErr
 }
+
+// Send is the legacy single-message entry point.
+func (p *Provider) Send(message, cliFormat string) error {
+	chunks, err := p.Prepare(msgpkg.Redact(message))
+	if err != nil {
+		return err
+	}
+	if len(chunks) == 0 {
+		return nil
+	}
+	return p.SendChunks(chunks, cliFormat)
+}
+
+// teamsHTTPClient posts Power Automate workflow messages. Office 365 connector
+// webhooks still go through shoutrrr.
+var teamsHTTPClient = &http.Client{Timeout: 15 * time.Second}
 
 func sendTeams(pr *Options, msg string) error {
 	kind, err := teamsWebhookKind(pr.TeamsWebHookURL)

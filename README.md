@@ -261,6 +261,50 @@ Notify flags can be configured at default config (`$HOME/.config/notify/config.y
 - As default notify sends notification line by line
 - Use `-bulk` to send notification as entire message/s (messages might be chunked)
 
+## Channel message guarantees
+
+Notify applies a per-channel processing pipeline so the same alert is
+delivered completely and correctly to every destination instead of being
+truncated by a single global length:
+
+1. **Encoding validation** — invalid UTF-8 is rejected with an error and the
+   original bytes are retained; bytes are never silently replaced with `?`.
+2. **Secret redaction** — credentials embedded in URLs, `token=`/`api_key=`
+   style secrets, `Bearer` tokens and internal/private IP addresses are
+   replaced by `[REDACTED]` before anything is sent or logged. The same rule
+   applies to every channel and every log line, so cleartext secrets never
+   reach the wire or disk.
+3. **Channel-specific escaping** — only the target channel's markup grammar
+   is escaped (Telegram HTML/Markdown/MarkdownV2, Slack/Discord mrkdwn).
+   Escaping changes representation, never the message meaning.
+4. **Character-accurate splitting** — each channel has its own budget measured
+   in characters (runes), so Chinese text and emoji are never cut in half.
+   Splits prefer line, then field boundaries; a URL or token is never split in
+   the middle. When an unbreakable item cannot fit, it degrades to a summary
+   stating how many characters were omitted.
+5. **Ordered fragments** — split messages carry a `[i/n]` sequence header so
+   receivers can detect gaps and reassemble in order. Short, unsplit messages
+   keep their original form with no header.
+
+### Per-channel length budget
+
+Every provider accepts an optional `message_limit` (characters). When unset a
+sensible platform default is used. Illegal values (below the minimum budget of
+40 characters) are rejected at startup rather than at send time.
+
+```yaml
+rocketchat:
+  - id: "small-channel"
+    rocketchat_webhook_url: "http://chat.example.com/hooks/a"
+    message_limit: 60    # tight budget: more, smaller fragments
+  - id: "large-channel"
+    rocketchat_webhook_url: "http://chat.example.com/hooks/b"
+    message_limit: 200   # generous budget: fewer, larger fragments
+```
+
+The same source message is split independently for each endpoint, so both
+destinations receive the full content within their own limits.
+
 ## References
 
 - [Creating Slack webhook](https://slack.com/intl/en-it/help/articles/115005265063-Incoming-webhooks-for-Slack)
